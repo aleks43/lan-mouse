@@ -1817,7 +1817,7 @@ dependencies = [
 
 [[package]]
 name = "lan-mouse-proto"
-version = "0.3.0"
+version = "0.4.0"
 dependencies = [
  "input-event",
  "num_enum",

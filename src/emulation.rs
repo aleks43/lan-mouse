@@ -3,7 +3,7 @@ use crate::listen::{LanMouseListener, ListenEvent, ListenerCreationError};
 use futures::StreamExt;
 use input_emulation::{EmulationHandle, InputEmulation, InputEmulationError};
 use input_event::Event;
-use lan_mouse_proto::{Position, ProtoEvent};
+use lan_mouse_proto::{ClipboardAssembly, ClipboardChunk, Position, ProtoEvent};
 use local_channel::mpsc::{Receiver, Sender, channel};
 use std::{
     cell::Cell,
@@ -64,6 +64,10 @@ pub(crate) enum EmulationEvent {
         addr: SocketAddr,
         commit: [u8; 8],
     },
+    /// a peer shared its clipboard contents
+    ClipboardText {
+        text: String,
+    },
 }
 
 enum EmulationRequest {
@@ -71,6 +75,8 @@ enum EmulationRequest {
     Release(SocketAddr),
     ChangePort(u16),
     Terminate,
+    /// broadcast clipboard chunks to all incoming connections
+    Clipboard(Vec<ClipboardChunk>),
 }
 
 impl Emulation {
@@ -86,6 +92,7 @@ impl Emulation {
             emulation_proxy,
             request_rx,
             event_tx,
+            clipboards: Default::default(),
         };
         let task = spawn_local(emulation_task.run());
         Self {
@@ -98,6 +105,12 @@ impl Emulation {
     pub(crate) fn send_leave_event(&self, addr: SocketAddr) {
         self.request_tx
             .send(EmulationRequest::Release(addr))
+            .expect("channel closed");
+    }
+
+    pub(crate) fn send_clipboard(&self, chunks: Vec<ClipboardChunk>) {
+        self.request_tx
+            .send(EmulationRequest::Clipboard(chunks))
             .expect("channel closed");
     }
 
@@ -134,6 +147,8 @@ struct ListenTask {
     emulation_proxy: EmulationProxy,
     request_rx: Receiver<EmulationRequest>,
     event_tx: Sender<EmulationEvent>,
+    /// reassembles clipboard transfers per peer
+    clipboards: HashMap<SocketAddr, ClipboardAssembly>,
 }
 
 impl ListenTask {
@@ -177,6 +192,14 @@ impl ListenTask {
                                 self.listener.reply(addr, ProtoEvent::Hello { commit: local_commit() }).await;
                                 self.event_tx.send(EmulationEvent::PeerHello { addr, commit }).expect("channel closed");
                             }
+                            ProtoEvent::Clipboard(chunk) => {
+                                let assembly = self.clipboards.entry(addr).or_default();
+                                match assembly.handle(chunk) {
+                                    Ok(Some(text)) => self.event_tx.send(EmulationEvent::ClipboardText { text }).expect("channel closed"),
+                                    Ok(None) => {}
+                                    Err(e) => log::debug!("clipboard transfer from {addr} failed: {e}"),
+                                }
+                            }
                             _ => {}
                         }
                     }
@@ -199,6 +222,11 @@ impl ListenTask {
                     EmulationRequest::Reenable => self.emulation_proxy.reenable(),
                     // notify the other end that we hit a barrier (should release capture)
                     EmulationRequest::Release(addr) => self.listener.reply(addr, ProtoEvent::Leave(0)).await,
+                    EmulationRequest::Clipboard(chunks) => {
+                        for chunk in chunks {
+                            self.listener.broadcast(ProtoEvent::Clipboard(chunk)).await;
+                        }
+                    }
                     EmulationRequest::ChangePort(port) => {
                         self.listener.request_port_change(port);
                         let result = self.listener.port_changed().await;
@@ -211,6 +239,7 @@ impl ListenTask {
                         if instant.elapsed() > Duration::from_secs(1) {
                             log::warn!("releasing keys: {addr} not responding!");
                             self.emulation_proxy.remove(addr);
+                            self.clipboards.remove(&addr);
                             self.event_tx.send(EmulationEvent::Disconnected { addr }).expect("channel closed");
                             false
                         } else {

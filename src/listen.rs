@@ -214,6 +214,16 @@ impl LanMouseListener {
         }
     }
 
+    /// send an event to all currently connected peers
+    pub(crate) async fn broadcast(&self, event: ProtoEvent) {
+        log::trace!("{event} >=>=>=>=>=> all");
+        let (buf, len): ([u8; MAX_EVENT_SIZE], usize) = event.into();
+        let conns = self.conns.lock().await;
+        for (_, conn) in conns.iter() {
+            let _ = conn.send(&buf[..len]).await;
+        }
+    }
+
     pub(crate) async fn get_certificate_fingerprint(&self, addr: SocketAddr) -> Option<String> {
         if let Some(conn) = self
             .conns

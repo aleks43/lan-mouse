@@ -9,7 +9,7 @@ use input_capture::{
     CaptureError, CaptureEvent, CaptureHandle, InputCapture, InputCaptureError, Position,
 };
 use input_event::{Event, KeyboardEvent, scancode};
-use lan_mouse_proto::ProtoEvent;
+use lan_mouse_proto::{ClipboardAssembly, ProtoEvent};
 use local_channel::mpsc::{Receiver, Sender, channel};
 use tokio::task::{JoinHandle, spawn_local};
 use tokio_util::sync::CancellationToken;
@@ -37,6 +37,8 @@ pub(crate) enum ICaptureEvent {
     /// either the remote client leaving its device region,
     /// a new device entering the screen or the release bind.
     ClientEntered(u64),
+    /// a peer shared its clipboard contents
+    ClipboardText { text: String },
 }
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
@@ -82,6 +84,7 @@ impl Capture {
             request_rx,
             release_bind: Rc::new(RefCell::new(release_bind)),
             state: Default::default(),
+            clipboard_asm: Default::default(),
         };
         let task = spawn_local(capture_task.run());
         Self {
@@ -166,6 +169,8 @@ struct CaptureTask {
     release_bind: Rc<RefCell<Vec<scancode::Linux>>>,
     request_rx: Receiver<CaptureRequest>,
     state: State,
+    /// reassembles clipboard transfers received from the active peer
+    clipboard_asm: ClipboardAssembly,
 }
 
 impl CaptureTask {
@@ -290,6 +295,16 @@ impl CaptureTask {
                             log::info!("releasing capture: left remote client device region");
                             self.release_capture(capture).await?;
                         },
+                        // clipboard sharing from the peer we are currently controlling
+                        ProtoEvent::Clipboard(chunk) => {
+                            match self.clipboard_asm.handle(chunk) {
+                                Ok(Some(text)) => self.event_tx
+                                    .send(ICaptureEvent::ClipboardText { text })
+                                    .expect("channel closed"),
+                                Ok(None) => {}
+                                Err(e) => log::debug!("clipboard transfer failed: {e}"),
+                            }
+                        }
                         _ => {}
                     }
                 },

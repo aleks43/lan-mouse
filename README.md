@@ -429,7 +429,28 @@ Where `left` can be either `left`, `right`, `top` or `bottom`.
 - [ ] X11 Input Capture
 - [ ] Latency measurement and visualization
 - [ ] Bandwidth usage measurement and visualization
-- [ ] Clipboard support
+- [x] Clipboard support
+
+
+## Clipboard
+
+Lan Mouse can synchronize the **text clipboard** between connected devices. The feature is
+enabled by default, as soon as a supported clipboard tool is available on the machine:
+
+| Platform | Requirement |
+|---|---|
+| MacOS | none (`pbcopy` / `pbpaste` ship with the OS) |
+| Wayland (wlroots compositors, KDE Plasma) | [wl-clipboard](https://github.com/bugaevc/wl-clipboard) (`wl-copy` / `wl-paste`) |
+| Wayland (GNOME) | GNOME does not implement any data-control protocol. Install the [ClipboardNext](https://extensions.gnome.org/extension/7570/clipboardnext/) shell extension (provides the `cb` CLI) or `xclip` (clipboard is bridged via XWayland) |
+| X11 | `xclip` or `xsel` |
+
+Behavior and limitations:
+- Only plain text is synchronized, images and files are not supported.
+- Clipboard changes are detected by polling and broadcast to all connected peers
+  (up to 1 MiB of text per copy).
+- If no clipboard tool is found, synchronization is silently disabled.
+- Peers running a lan-mouse version older than the clipboard release ignore
+  clipboard transfers.
 
 
 ## Detailed OS Support

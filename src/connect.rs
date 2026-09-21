@@ -93,27 +93,161 @@ async fn connect_any(
 }
 
 pub(crate) struct LanMouseConnection {
+    sender: LanMouseSender,
+    recv_rx: Receiver<(ClientHandle, ProtoEvent)>,
+}
+
+/// Cloneable sending half of a [`LanMouseConnection`].
+/// Allows multiple owners (capture task, clipboard sync) to send
+/// events to the configured clients while only one owns the
+/// receive side.
+#[derive(Clone)]
+pub(crate) struct LanMouseSender {
     cert: Certificate,
     client_manager: ClientManager,
     conns: Rc<Mutex<HashMap<SocketAddr, Arc<dyn Conn + Send + Sync>>>>,
     connecting: Rc<Mutex<HashSet<ClientHandle>>>,
-    recv_rx: Receiver<(ClientHandle, ProtoEvent)>,
     recv_tx: Sender<(ClientHandle, ProtoEvent)>,
     ping_response: Rc<RefCell<HashSet<SocketAddr>>>,
 }
 
-impl LanMouseConnection {
-    pub(crate) fn new(cert: Certificate, client_manager: ClientManager) -> Self {
-        let (recv_tx, recv_rx) = channel();
+impl LanMouseSender {
+    fn new(
+        cert: Certificate,
+        client_manager: ClientManager,
+        recv_tx: Sender<(ClientHandle, ProtoEvent)>,
+    ) -> Self {
         Self {
             cert,
             client_manager,
             conns: Default::default(),
             connecting: Default::default(),
-            recv_rx,
             recv_tx,
             ping_response: Default::default(),
         }
+    }
+
+    pub(crate) async fn send(
+        &self,
+        event: ProtoEvent,
+        handle: ClientHandle,
+    ) -> Result<(), LanMouseConnectionError> {
+        if let Some(addr) = self.client_manager.active_addr(handle) {
+            let conn = {
+                let conns = self.conns.lock().await;
+                conns.get(&addr).cloned()
+            };
+            if let Some(conn) = conn {
+                if !self.client_manager.alive(handle) {
+                    return Err(LanMouseConnectionError::TargetEmulationDisabled);
+                }
+                log::trace!("{event} >->->->->- {addr}");
+                let (buf, len): ([u8; MAX_EVENT_SIZE], usize) = event.into();
+                let buf = &buf[..len];
+                match conn.send(buf).await {
+                    Ok(_) => {}
+                    Err(e) => {
+                        log::warn!("client {handle} failed to send: {e}");
+                        disconnect(&self.client_manager, handle, addr, &self.conns).await;
+                    }
+                }
+                return Ok(());
+            }
+        }
+
+        // check if we are already trying to connect
+        let mut connecting = self.connecting.lock().await;
+        if !connecting.contains(&handle) {
+            connecting.insert(handle);
+            // connect in the background
+            spawn_local(self.clone().connect_to_handle(handle));
+        }
+        Err(LanMouseConnectionError::NotConnected)
+    }
+
+    /// client handles with a currently established connection.
+    /// Used to broadcast events (e.g. clipboard updates) without
+    /// triggering new connections for clients we never talked to.
+    pub(crate) async fn connected_clients(&self) -> Vec<ClientHandle> {
+        let conns = self.conns.lock().await;
+        self.client_manager
+            .registered_clients()
+            .into_iter()
+            .filter(|&handle| {
+                self.client_manager.alive(handle)
+                    && self
+                        .client_manager
+                        .active_addr(handle)
+                        .is_some_and(|addr| conns.contains_key(&addr))
+            })
+            .collect()
+    }
+
+    async fn connect_to_handle(self, handle: ClientHandle) -> Result<(), LanMouseConnectionError> {
+        log::info!("client {handle} connecting ...");
+        // sending did not work, figure out active conn.
+        if let Some(addrs) = self.client_manager.get_ips(handle) {
+            let port = self.client_manager.get_port(handle).unwrap_or(DEFAULT_PORT);
+            let addrs = addrs
+                .into_iter()
+                .map(|a| SocketAddr::new(a, port))
+                .collect::<Vec<_>>();
+            log::info!("client ({handle}) connecting ... (ips: {addrs:?})");
+            let res = connect_any(&addrs, self.cert.clone()).await;
+            let (conn, addr) = match res {
+                Ok(c) => c,
+                Err(e) => {
+                    self.connecting.lock().await.remove(&handle);
+                    return Err(e);
+                }
+            };
+            log::info!("client ({handle}) connected @ {addr}");
+            self.client_manager.set_active_addr(handle, Some(addr));
+            self.conns.lock().await.insert(addr, conn.clone());
+            self.connecting.lock().await.remove(&handle);
+
+            // Best-effort version handshake. Send our commit hash once
+            // immediately after the DTLS handshake; the listen side
+            // mirrors a Hello back so the receive loop can populate
+            // `peer_commit`. Old peers will silently skip this event
+            // per the forward-compat handler in [`receive_loop`].
+            let (buf, len) = ProtoEvent::Hello {
+                commit: local_commit(),
+            }
+            .into();
+            if let Err(e) = conn.send(&buf[..len]).await {
+                log::debug!("hello send to {addr} failed: {e}");
+            }
+
+            // poll connection for active
+            spawn_local(ping_pong(addr, conn.clone(), self.ping_response.clone()));
+
+            // receiver
+            spawn_local(receive_loop(
+                self.client_manager.clone(),
+                handle,
+                addr,
+                conn,
+                self.conns.clone(),
+                self.recv_tx.clone(),
+                self.ping_response.clone(),
+            ));
+            return Ok(());
+        }
+        self.connecting.lock().await.remove(&handle);
+        Err(LanMouseConnectionError::NotConnected)
+    }
+}
+
+impl LanMouseConnection {
+    pub(crate) fn new(cert: Certificate, client_manager: ClientManager) -> Self {
+        let (recv_tx, recv_rx) = channel();
+        let sender = LanMouseSender::new(cert, client_manager, recv_tx);
+        Self { sender, recv_rx }
+    }
+
+    pub(crate) fn sender(&self) -> LanMouseSender {
+        self.sender.clone()
     }
 
     pub(crate) async fn recv(&mut self) -> (ClientHandle, ProtoEvent) {
@@ -125,109 +259,8 @@ impl LanMouseConnection {
         event: ProtoEvent,
         handle: ClientHandle,
     ) -> Result<(), LanMouseConnectionError> {
-        let (buf, len): ([u8; MAX_EVENT_SIZE], usize) = event.into();
-        let buf = &buf[..len];
-        if let Some(addr) = self.client_manager.active_addr(handle) {
-            let conn = {
-                let conns = self.conns.lock().await;
-                conns.get(&addr).cloned()
-            };
-            if let Some(conn) = conn {
-                if !self.client_manager.alive(handle) {
-                    return Err(LanMouseConnectionError::TargetEmulationDisabled);
-                }
-                match conn.send(buf).await {
-                    Ok(_) => {}
-                    Err(e) => {
-                        log::warn!("client {handle} failed to send: {e}");
-                        disconnect(&self.client_manager, handle, addr, &self.conns).await;
-                    }
-                }
-                log::trace!("{event} >->->->->- {addr}");
-                return Ok(());
-            }
-        }
-
-        // check if we are already trying to connect
-        let mut connecting = self.connecting.lock().await;
-        if !connecting.contains(&handle) {
-            connecting.insert(handle);
-            // connect in the background
-            spawn_local(connect_to_handle(
-                self.client_manager.clone(),
-                self.cert.clone(),
-                handle,
-                self.conns.clone(),
-                self.connecting.clone(),
-                self.recv_tx.clone(),
-                self.ping_response.clone(),
-            ));
-        }
-        Err(LanMouseConnectionError::NotConnected)
+        self.sender.send(event, handle).await
     }
-}
-
-async fn connect_to_handle(
-    client_manager: ClientManager,
-    cert: Certificate,
-    handle: ClientHandle,
-    conns: Rc<Mutex<HashMap<SocketAddr, Arc<dyn Conn + Send + Sync>>>>,
-    connecting: Rc<Mutex<HashSet<ClientHandle>>>,
-    tx: Sender<(ClientHandle, ProtoEvent)>,
-    ping_response: Rc<RefCell<HashSet<SocketAddr>>>,
-) -> Result<(), LanMouseConnectionError> {
-    log::info!("client {handle} connecting ...");
-    // sending did not work, figure out active conn.
-    if let Some(addrs) = client_manager.get_ips(handle) {
-        let port = client_manager.get_port(handle).unwrap_or(DEFAULT_PORT);
-        let addrs = addrs
-            .into_iter()
-            .map(|a| SocketAddr::new(a, port))
-            .collect::<Vec<_>>();
-        log::info!("client ({handle}) connecting ... (ips: {addrs:?})");
-        let res = connect_any(&addrs, cert).await;
-        let (conn, addr) = match res {
-            Ok(c) => c,
-            Err(e) => {
-                connecting.lock().await.remove(&handle);
-                return Err(e);
-            }
-        };
-        log::info!("client ({handle}) connected @ {addr}");
-        client_manager.set_active_addr(handle, Some(addr));
-        conns.lock().await.insert(addr, conn.clone());
-        connecting.lock().await.remove(&handle);
-
-        // Best-effort version handshake. Send our commit hash once
-        // immediately after the DTLS handshake; the listen side
-        // mirrors a Hello back so the receive loop can populate
-        // `peer_commit`. Old peers will silently skip this event
-        // per the forward-compat handler in [`receive_loop`].
-        let (buf, len) = ProtoEvent::Hello {
-            commit: local_commit(),
-        }
-        .into();
-        if let Err(e) = conn.send(&buf[..len]).await {
-            log::debug!("hello send to {addr} failed: {e}");
-        }
-
-        // poll connection for active
-        spawn_local(ping_pong(addr, conn.clone(), ping_response.clone()));
-
-        // receiver
-        spawn_local(receive_loop(
-            client_manager,
-            handle,
-            addr,
-            conn,
-            conns,
-            tx,
-            ping_response.clone(),
-        ));
-        return Ok(());
-    }
-    connecting.lock().await.remove(&handle);
-    Err(LanMouseConnectionError::NotConnected)
 }
 
 async fn ping_pong(
