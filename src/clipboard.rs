@@ -122,18 +122,8 @@ fn tool_candidates() -> Vec<CliTool> {
         };
         let xclip = || CliTool {
             name: "xclip",
-            // Do not fall back to X11's legacy STRING target: it is
-            // single-byte text and turns UTF-8 Cyrillic into mojibake on a
-            // receiving native clipboard (such as macOS pasteboard).
-            get: CliCommand::get(
-                "xclip",
-                &["-selection", "clipboard", "-o", "-target", "UTF8_STRING"],
-            ),
-            set: CliCommand::set(
-                "xclip",
-                &["-selection", "clipboard", "-target", "UTF8_STRING"],
-                false,
-            ),
+            get: CliCommand::get("xclip", &["-selection", "clipboard", "-o"]),
+            set: CliCommand::set("xclip", &["-selection", "clipboard"], false),
         };
         let xsel = || CliTool {
             name: "xsel",
