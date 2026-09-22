@@ -389,7 +389,10 @@ impl Service {
                 self.clipboard_transfer.set(transfer.wrapping_add(1));
                 let chunks = clipboard_chunks(transfer, &text);
                 log::debug!("sharing clipboard text ({} bytes)", text.len());
-                for handle in self.conn_sender.connected_clients().await {
+                // A clipboard update is also a useful opportunity to restore a
+                // connection after the peer was restarted. `send` deduplicates
+                // concurrent connection attempts for a handle.
+                for handle in self.client_manager.active_clients() {
                     for chunk in chunks.iter() {
                         let event = ProtoEvent::Clipboard(chunk.clone());
                         if let Err(e) = self.conn_sender.send(event, handle).await {

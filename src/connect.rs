@@ -165,24 +165,6 @@ impl LanMouseSender {
         Err(LanMouseConnectionError::NotConnected)
     }
 
-    /// client handles with a currently established connection.
-    /// Used to broadcast events (e.g. clipboard updates) without
-    /// triggering new connections for clients we never talked to.
-    pub(crate) async fn connected_clients(&self) -> Vec<ClientHandle> {
-        let conns = self.conns.lock().await;
-        self.client_manager
-            .registered_clients()
-            .into_iter()
-            .filter(|&handle| {
-                self.client_manager.alive(handle)
-                    && self
-                        .client_manager
-                        .active_addr(handle)
-                        .is_some_and(|addr| conns.contains_key(&addr))
-            })
-            .collect()
-    }
-
     async fn connect_to_handle(self, handle: ClientHandle) -> Result<(), LanMouseConnectionError> {
         log::info!("client {handle} connecting ...");
         // sending did not work, figure out active conn.

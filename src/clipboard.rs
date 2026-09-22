@@ -1,5 +1,5 @@
 use local_channel::mpsc::{Receiver, Sender, channel};
-use std::time::Duration;
+use std::{cell::Cell, rc::Rc, time::Duration};
 use tokio::process::Command;
 use tokio::task::{JoinHandle, spawn_local};
 
@@ -42,12 +42,14 @@ impl CliCommand {
     fn probe(&self) -> CliCommand {
         CliCommand {
             program: self.program,
-            // xclip uses the single-dash spelling; `--version` exits with
-            // an error even though the executable is otherwise usable.
-            args: if self.program == "xclip" {
-                &["-version"]
-            } else {
-                &["--version"]
+            args: match self.program {
+                // xclip uses the single-dash spelling; `--version` exits with
+                // an error even though the executable is otherwise usable.
+                "xclip" => &["-version"],
+                // pbpaste has no version flag. Invoking it without arguments
+                // is both its normal read operation and an availability check.
+                "pbpaste" => &[],
+                _ => &["--version"],
             },
             text_arg: false,
             text_stdin: false,
@@ -183,7 +185,7 @@ pub(crate) enum ClipboardEvent {
 
 pub(crate) enum ClipboardRequest {
     /// apply text received from a peer to the local clipboard
-    Set(String),
+    Set { text: String, generation: u64 },
 }
 
 /// owns the clipboard polling task
@@ -192,18 +194,25 @@ pub(crate) struct Clipboard {
     event_rx: Receiver<ClipboardEvent>,
     task: JoinHandle<()>,
     disabled: bool,
+    /// A remote write has been queued but has not yet become observable via
+    /// the clipboard tool. This is shared with the task so a poll already in
+    /// flight cannot broadcast the old clipboard value back to the peer.
+    pending_remote_write: Rc<Cell<Option<u64>>>,
+    next_generation: Cell<u64>,
 }
 
 impl Clipboard {
     pub(crate) fn new() -> Self {
         let (request_tx, request_rx) = channel();
         let (event_tx, event_rx) = channel();
+        let pending_remote_write = Rc::new(Cell::new(None));
         let task = spawn_local(
             ClipboardTask {
                 request_rx,
                 event_tx,
                 last_seen: None,
                 last_set: None,
+                pending_remote_write: pending_remote_write.clone(),
             }
             .run(),
         );
@@ -212,6 +221,8 @@ impl Clipboard {
             event_rx,
             task,
             disabled: false,
+            pending_remote_write,
+            next_generation: Cell::new(0),
         }
     }
 
@@ -219,7 +230,16 @@ impl Clipboard {
         if self.disabled {
             return;
         }
-        let _ = self.request_tx.send(ClipboardRequest::Set(text));
+        let generation = self.next_generation.get().wrapping_add(1);
+        self.next_generation.set(generation);
+        self.pending_remote_write.set(Some(generation));
+        if self
+            .request_tx
+            .send(ClipboardRequest::Set { text, generation })
+            .is_err()
+        {
+            self.pending_remote_write.set(None);
+        }
     }
 
     pub(crate) async fn event(&mut self) -> ClipboardEvent {
@@ -247,6 +267,7 @@ struct ClipboardTask {
     last_seen: Option<String>,
     /// last text applied from a remote peer
     last_set: Option<String>,
+    pending_remote_write: Rc<Cell<Option<u64>>>,
 }
 
 impl ClipboardTask {
@@ -264,9 +285,36 @@ impl ClipboardTask {
 
         loop {
             tokio::select! {
+                // A received clipboard value must win over a due polling tick.
+                // Otherwise a poll can observe the old local value and send it
+                // back before the remote write is applied.
+                biased;
+                request = self.request_rx.recv() => match request {
+                    Some(ClipboardRequest::Set { text, generation }) => {
+                        match tool.set.run(Some(&text)).await {
+                            Ok(_) => {
+                                log::debug!("applied remote clipboard text");
+                                self.last_set = Some(text.clone());
+                                self.last_seen = Some(text);
+                            }
+                            Err(e) => log::warn!("clipboard write failed: {e}"),
+                        }
+                        if self.pending_remote_write.get() == Some(generation) {
+                            self.pending_remote_write.set(None);
+                        }
+                    }
+                    None => break,
+                },
                 _ = interval.tick() => {
                     match tool.get.run(None).await {
                         Ok(output) => {
+                            // `wl-paste`/`pbpaste` may have started before the
+                            // remote write was queued. Its output is stale in
+                            // that case; dropping it prevents a feedback loop.
+                            if self.pending_remote_write.get().is_some() {
+                                log::debug!("discarding clipboard poll while remote write is pending");
+                                continue;
+                            }
                             let text = normalize(String::from_utf8_lossy(&output.stdout).into_owned());
                             if Some(&text) == self.last_seen.as_ref() {
                                 continue;
@@ -290,19 +338,6 @@ impl ClipboardTask {
                         }
                     }
                 }
-                request = self.request_rx.recv() => match request {
-                    Some(ClipboardRequest::Set(text)) => {
-                        match tool.set.run(Some(&text)).await {
-                            Ok(_) => {
-                                log::debug!("applied remote clipboard text");
-                                self.last_set = Some(text.clone());
-                                self.last_seen = Some(text);
-                            }
-                            Err(e) => log::warn!("clipboard write failed: {e}"),
-                        }
-                    }
-                    None => break,
-                },
             }
         }
     }
