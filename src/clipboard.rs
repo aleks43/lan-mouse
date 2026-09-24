@@ -46,8 +46,9 @@ impl CliCommand {
                 // xclip uses the single-dash spelling; `--version` exits with
                 // an error even though the executable is otherwise usable.
                 "xclip" => &["-version"],
-                // pbpaste has no version flag. Invoking it without arguments
-                // is both its normal read operation and an availability check.
+                // pbpaste has no version flag. Invoke its normal read command;
+                // `detect_tool` treats a successful spawn as availability because
+                // an empty/non-text pasteboard can make pbpaste exit nonzero.
                 "pbpaste" => &[],
                 _ => &["--version"],
             },
@@ -157,7 +158,10 @@ fn tool_candidates() -> Vec<CliTool> {
 async fn detect_tool() -> Option<CliTool> {
     for tool in tool_candidates() {
         match tool.get.probe().run(None).await {
-            Ok(output) if output.status.success() => {
+            // `pbpaste` exits nonzero when there is no textual clipboard data,
+            // which is normal at startup. Successful process creation is enough
+            // to establish that the macOS clipboard backend is installed.
+            Ok(output) if output.status.success() || tool.get.program == "pbpaste" => {
                 log::info!("clipboard sync enabled, backend: {}", tool.name);
                 return Some(tool);
             }
