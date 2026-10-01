@@ -155,6 +155,11 @@ impl Window {
         {
             use crate::macos_privacy;
             if macos_privacy::accessibility_granted() {
+                if !macos_privacy::input_monitoring_granted() {
+                    log::info!("capture row clicked with Input Monitoring unavailable");
+                    macos_privacy::open_input_monitoring_settings();
+                    return;
+                }
                 // AX granted but the row is still visible => the daemon
                 // subprocess bailed before AX was in place and needs a
                 // fresh process. Quit + relaunch via Launch Services.

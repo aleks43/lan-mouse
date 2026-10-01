@@ -75,6 +75,12 @@ impl CliCommand {
     fn command(&self) -> Command {
         let mut cmd = Command::new(self.program);
         cmd.args(self.args);
+        // GUI-launched macOS apps may have no UTF-8 locale. In that case
+        // pbcopy interprets UTF-8 bytes using the user's legacy Mac encoding.
+        #[cfg(target_os = "macos")]
+        if matches!(self.program, "pbcopy" | "pbpaste") {
+            cmd.env("LC_CTYPE", "en_US.UTF-8");
+        }
         cmd.stdin(std::process::Stdio::null());
         cmd.stderr(std::process::Stdio::null());
         // never leave a hung tool behind when the future is dropped or times out
