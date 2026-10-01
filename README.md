@@ -385,6 +385,9 @@ release_bind = [ "KeyA", "KeyS", "KeyD", "KeyF" ]
 # optional port (defaults to 4242)
 port = 4242
 
+# optional, set to false to disable clipboard synchronization (defaults to true)
+# clipboard = false
+
 # list of authorized tls certificate fingerprints that
 # are accepted for incoming traffic
 [authorized_fingerprints]
@@ -435,7 +438,9 @@ Where `left` can be either `left`, `right`, `top` or `bottom`.
 ## Clipboard
 
 Lan Mouse can synchronize the **text clipboard** between connected devices. The feature is
-enabled by default, as soon as a supported clipboard tool is available on the machine:
+enabled by default, as soon as a supported clipboard tool is available on the machine.
+It can be turned off with `clipboard = false` in the [config file](#configuration)
+(requires a restart).
 
 | Platform | Requirement |
 |---|---|
@@ -443,14 +448,24 @@ enabled by default, as soon as a supported clipboard tool is available on the ma
 | Wayland (wlroots compositors, KDE Plasma) | [wl-clipboard](https://github.com/bugaevc/wl-clipboard) (`wl-copy` / `wl-paste`) |
 | Wayland (GNOME) | GNOME does not implement any data-control protocol. Install the [ClipboardNext](https://extensions.gnome.org/extension/7570/clipboardnext/) shell extension (provides the `cb` CLI) or `xclip` (clipboard is bridged via XWayland) |
 | X11 | `xclip` or `xsel` |
+| Windows | not supported yet |
 
 Behavior and limitations:
 - Only plain text is synchronized, images and files are not supported.
-- Clipboard changes are detected by polling and broadcast to all connected peers
-  (up to 1 MiB of text per copy).
-- If no clipboard tool is found, synchronization is silently disabled.
-- Peers running a lan-mouse version older than the clipboard release ignore
-  clipboard transfers.
+- Clipboard changes are detected by polling and sent to all connected peers
+  (up to 1 MiB of text per copy). The clipboard contents present at startup are not sent.
+- **Privacy:** everything copied on a device, including passwords copied from a password manager,
+  is sent to all connected (authorized) peers and replaces their clipboard. Disable the
+  feature if this is not desired.
+- Text is sent as unacknowledged UDP datagrams. On lossy networks a (large) copy
+  can get lost, it is then not retransmitted.
+- With `cb` (ClipboardNext) the text is passed as a command line argument, texts larger than
+  100 KiB or starting with `-` are not applied, and the text is visible in the process list
+  of the receiving machine while it is being written.
+- If no clipboard tool is found, synchronization is disabled (logged at startup).
+- Clipboard data is only sent to peers that announce support for it in their handshake,
+  peers running a lan-mouse version older than the clipboard release are skipped.
+  Both sides need to be updated to synchronize the clipboard.
 
 
 ## Detailed OS Support

@@ -1,5 +1,6 @@
 use std::{
     cell::{Cell, RefCell},
+    collections::HashMap,
     rc::Rc,
     time::{Duration, Instant},
 };
@@ -9,7 +10,7 @@ use input_capture::{
     CaptureError, CaptureEvent, CaptureHandle, InputCapture, InputCaptureError, Position,
 };
 use input_event::{Event, KeyboardEvent, scancode};
-use lan_mouse_proto::{ClipboardAssembly, ProtoEvent};
+use lan_mouse_proto::{ClipboardAssembly, ClipboardChunk, ProtoEvent};
 use local_channel::mpsc::{Receiver, Sender, channel};
 use tokio::task::{JoinHandle, spawn_local};
 use tokio_util::sync::CancellationToken;
@@ -169,11 +170,28 @@ struct CaptureTask {
     release_bind: Rc<RefCell<Vec<scancode::Linux>>>,
     request_rx: Receiver<CaptureRequest>,
     state: State,
-    /// reassembles clipboard transfers received from the active peer
-    clipboard_asm: ClipboardAssembly,
+    /// reassembles clipboard transfers received from peers (one per client,
+    /// chunks of different peers must not reset each other)
+    clipboard_asm: HashMap<CaptureHandle, ClipboardAssembly>,
 }
 
 impl CaptureTask {
+    /// feed a clipboard chunk received from `handle`, forwarding the
+    /// complete text once the transfer has finished
+    fn handle_clipboard_chunk(&mut self, handle: CaptureHandle, chunk: ClipboardChunk) {
+        if !self.conn.clipboard_enabled() {
+            return;
+        }
+        match self.clipboard_asm.entry(handle).or_default().handle(chunk) {
+            Ok(Some(text)) => self
+                .event_tx
+                .send(ICaptureEvent::ClipboardText { text })
+                .expect("channel closed"),
+            Ok(None) => {}
+            Err(e) => log::debug!("clipboard transfer from client {handle} failed: {e}"),
+        }
+    }
+
     fn add_capture(&mut self, handle: CaptureHandle, pos: Position, capture_type: CaptureType) {
         self.captures.push((handle, pos, capture_type));
     }
@@ -211,6 +229,13 @@ impl CaptureTask {
             }
             loop {
                 tokio::select! {
+                    // clipboard sharing does not depend on input capture being
+                    // available, keep receiving it (and drop everything else)
+                    (handle, event) = self.conn.recv() => {
+                        if let ProtoEvent::Clipboard(chunk) = event {
+                            self.handle_clipboard_chunk(handle, chunk);
+                        }
+                    }
                     r = self.request_rx.recv() => match r.expect("channel closed") {
                         CaptureRequest::Reenable => break,
                         CaptureRequest::Create(h, p, t) => self.add_capture(h, p, t),
@@ -276,6 +301,11 @@ impl CaptureTask {
                     None => return Ok(()),
                 },
                 (handle, event) = self.conn.recv() => {
+                    // clipboard text is accepted from every peer
+                    if let ProtoEvent::Clipboard(chunk) = event {
+                        self.handle_clipboard_chunk(handle, chunk);
+                        continue
+                    }
                     if let Some(active) = self.active_client {
                         if handle != active {
                             // we only care about events coming from the client we are currently connected to
@@ -295,16 +325,6 @@ impl CaptureTask {
                             log::info!("releasing capture: left remote client device region");
                             self.release_capture(capture).await?;
                         },
-                        // clipboard sharing from the peer we are currently controlling
-                        ProtoEvent::Clipboard(chunk) => {
-                            match self.clipboard_asm.handle(chunk) {
-                                Ok(Some(text)) => self.event_tx
-                                    .send(ICaptureEvent::ClipboardText { text })
-                                    .expect("channel closed"),
-                                Ok(None) => {}
-                                Err(e) => log::debug!("clipboard transfer failed: {e}"),
-                            }
-                        }
                         _ => {}
                     }
                 },

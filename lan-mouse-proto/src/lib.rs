@@ -7,6 +7,14 @@ use std::{
 };
 use thiserror::Error;
 
+/// capability flag advertised in [`ProtoEvent::Hello`]: the peer understands
+/// and wants to receive [`ProtoEvent::Clipboard`] events.
+///
+/// Peers predating clipboard support use a smaller receive buffer and drop
+/// the connection when they receive a clipboard datagram, so clipboard data
+/// must only ever be sent to peers that advertised this flag.
+pub const CAP_CLIPBOARD: u8 = 1;
+
 /// maximum payload size of a single [`ProtoEvent::Clipboard`] chunk
 pub const CLIPBOARD_CHUNK_SIZE: usize = 1024;
 
@@ -199,7 +207,9 @@ pub enum ProtoEvent {
     /// `shadow_rs`'s `SHORT_COMMIT`. Old peers that don't
     /// recognize the event type silently skip it per the
     /// forward-compat handling in the receive loop.
-    Hello { commit: [u8; 8] },
+    /// `caps` is a bitmask of capability flags (e.g. [`CAP_CLIPBOARD`]), appended
+    /// after the commit hash so that older peers simply ignore it.
+    Hello { commit: [u8; 8], caps: u8 },
     /// a chunk of clipboard text, see [`ClipboardChunk`] and [`clipboard_chunks`].
     /// Sent by a peer that wants to share its clipboard contents. The
     /// receiving side reassembles chunks with [`ClipboardAssembly`].
@@ -221,9 +231,9 @@ impl Display for ProtoEvent {
                     if *alive { "alive" } else { "not available" }
                 )
             }
-            ProtoEvent::Hello { commit } => {
+            ProtoEvent::Hello { commit, caps } => {
                 let s = std::str::from_utf8(commit).unwrap_or("????????");
-                write!(f, "Hello({s})")
+                write!(f, "Hello({s}, caps: {caps:#04x})")
             }
             ProtoEvent::Clipboard(c) => write!(
                 f,
@@ -336,7 +346,10 @@ impl TryFrom<[u8; MAX_EVENT_SIZE]> for ProtoEvent {
                 for b in commit.iter_mut() {
                     *b = decode_u8(&mut buf)?;
                 }
-                Ok(Self::Hello { commit })
+                // capability flags were appended to `Hello` later. Older peers
+                // do not send them, the (zeroed) rest of the buffer decodes as 0.
+                let caps = decode_u8(&mut buf).unwrap_or(0);
+                Ok(Self::Hello { commit, caps })
             }
             EventType::Clipboard => {
                 let transfer = decode_u32(&mut buf)?;
@@ -419,10 +432,11 @@ impl From<ProtoEvent> for ([u8; MAX_EVENT_SIZE], usize) {
                 ProtoEvent::Enter(pos) => encode_u8(buf, len, pos as u8),
                 ProtoEvent::Leave(serial) => encode_u32(buf, len, serial),
                 ProtoEvent::Ack(serial) => encode_u32(buf, len, serial),
-                ProtoEvent::Hello { commit } => {
+                ProtoEvent::Hello { commit, caps } => {
                     for b in commit.iter() {
                         encode_u8(buf, len, *b);
                     }
+                    encode_u8(buf, len, caps);
                 }
                 ProtoEvent::Clipboard(chunk) => {
                     debug_assert!(chunk.data.len() <= CLIPBOARD_CHUNK_SIZE);
@@ -487,6 +501,45 @@ mod tests {
         let (buf, len): ([u8; MAX_EVENT_SIZE], usize) = event.into();
         assert!(len <= MAX_EVENT_SIZE);
         ProtoEvent::try_from(buf)
+    }
+
+    #[test]
+    fn hello_roundtrip_with_caps() {
+        let event = ProtoEvent::Hello {
+            commit: *b"abcdef01",
+            caps: CAP_CLIPBOARD,
+        };
+        match roundtrip(event).expect("decode") {
+            ProtoEvent::Hello { commit, caps } => {
+                assert_eq!(&commit, b"abcdef01");
+                assert_eq!(caps, CAP_CLIPBOARD);
+            }
+            _ => panic!("unexpected event type"),
+        }
+    }
+
+    #[test]
+    fn hello_from_old_peer_has_no_caps() {
+        // an old peer sends only the type byte and the 8 byte commit hash
+        let mut buf = [0u8; MAX_EVENT_SIZE];
+        buf[0] = u8::from(EventType::Hello);
+        buf[1..9].copy_from_slice(b"abcdef01");
+        match ProtoEvent::try_from(buf).expect("decode") {
+            ProtoEvent::Hello { caps, .. } => assert_eq!(caps, 0),
+            _ => panic!("unexpected event type"),
+        }
+    }
+
+    #[test]
+    fn hello_fits_old_receive_buffer() {
+        // old peers receive into a 17 byte buffer, a longer Hello would
+        // make them drop the connection
+        let (_, len): ([u8; MAX_EVENT_SIZE], usize) = ProtoEvent::Hello {
+            commit: [0; 8],
+            caps: CAP_CLIPBOARD,
+        }
+        .into();
+        assert!(len <= 17);
     }
 
     #[test]

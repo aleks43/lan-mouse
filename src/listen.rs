@@ -3,7 +3,7 @@ use lan_mouse_proto::{MAX_EVENT_SIZE, ProtoEvent};
 use local_channel::mpsc::{Receiver, Sender, channel};
 use rustls::pki_types::CertificateDer;
 use std::{
-    collections::{HashMap, VecDeque},
+    collections::{HashMap, HashSet, VecDeque},
     net::SocketAddr,
     rc::Rc,
     sync::{Arc, Mutex, RwLock},
@@ -214,13 +214,15 @@ impl LanMouseListener {
         }
     }
 
-    /// send an event to all currently connected peers
-    pub(crate) async fn broadcast(&self, event: ProtoEvent) {
-        log::trace!("{event} >=>=>=>=>=> all");
+    /// send an event to all currently connected peers contained in `peers`
+    pub(crate) async fn send_to_peers(&self, event: ProtoEvent, peers: &HashSet<SocketAddr>) {
+        log::trace!("{event} >=>=>=>=>=> {} peer(s)", peers.len());
         let (buf, len): ([u8; MAX_EVENT_SIZE], usize) = event.into();
         let conns = self.conns.lock().await;
-        for (_, conn) in conns.iter() {
-            let _ = conn.send(&buf[..len]).await;
+        for (addr, conn) in conns.iter().filter(|(a, _)| peers.contains(a)) {
+            if let Err(e) = conn.send(&buf[..len]).await {
+                log::debug!("send to {addr} failed: {e}");
+            }
         }
     }
 
@@ -263,7 +265,13 @@ async fn read_loop(
 ) -> Result<(), Error> {
     let mut b = [0u8; MAX_EVENT_SIZE];
 
-    while conn.recv(&mut b).await.is_ok() {
+    loop {
+        // clear leftovers of previous (longer) datagrams, `recv` only
+        // overwrites the bytes of the datagram it received
+        b.fill(0);
+        if conn.recv(&mut b).await.is_err() {
+            break;
+        }
         match b.try_into() {
             Ok(event) => dtls_tx
                 .send(ListenEvent::Msg { event, addr })

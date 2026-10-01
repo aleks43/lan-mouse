@@ -1,7 +1,7 @@
 use crate::client::ClientManager;
 use crate::config::local_commit;
 use lan_mouse_ipc::{ClientHandle, DEFAULT_PORT};
-use lan_mouse_proto::{MAX_EVENT_SIZE, ProtoEvent};
+use lan_mouse_proto::{CAP_CLIPBOARD, MAX_EVENT_SIZE, ProtoEvent};
 use local_channel::mpsc::{Receiver, Sender, channel};
 use std::{
     cell::RefCell,
@@ -109,6 +109,10 @@ pub(crate) struct LanMouseSender {
     connecting: Rc<Mutex<HashSet<ClientHandle>>>,
     recv_tx: Sender<(ClientHandle, ProtoEvent)>,
     ping_response: Rc<RefCell<HashSet<SocketAddr>>>,
+    /// capability flags advertised to peers in our `Hello`
+    caps: u8,
+    /// clients whose `Hello` advertised [`CAP_CLIPBOARD`]
+    clipboard_peers: Rc<RefCell<HashSet<ClientHandle>>>,
 }
 
 impl LanMouseSender {
@@ -116,8 +120,11 @@ impl LanMouseSender {
         cert: Certificate,
         client_manager: ClientManager,
         recv_tx: Sender<(ClientHandle, ProtoEvent)>,
+        caps: u8,
     ) -> Self {
         Self {
+            caps,
+            clipboard_peers: Default::default(),
             cert,
             client_manager,
             conns: Default::default(),
@@ -148,7 +155,14 @@ impl LanMouseSender {
                     Ok(_) => {}
                     Err(e) => {
                         log::warn!("client {handle} failed to send: {e}");
-                        disconnect(&self.client_manager, handle, addr, &self.conns).await;
+                        disconnect(
+                            &self.client_manager,
+                            handle,
+                            addr,
+                            &self.conns,
+                            &self.clipboard_peers,
+                        )
+                        .await;
                     }
                 }
                 return Ok(());
@@ -163,6 +177,26 @@ impl LanMouseSender {
             spawn_local(self.clone().connect_to_handle(handle));
         }
         Err(LanMouseConnectionError::NotConnected)
+    }
+
+    /// whether the client announced support for clipboard transfers.
+    /// Peers predating clipboard support drop the connection on receiving
+    /// clipboard datagrams, so nothing may be sent to them.
+    pub(crate) fn supports_clipboard(&self, handle: ClientHandle) -> bool {
+        self.clipboard_peers.borrow().contains(&handle)
+    }
+
+    /// whether a connection to the client is currently established
+    pub(crate) fn is_connected(&self, handle: ClientHandle) -> bool {
+        self.client_manager.active_addr(handle).is_some()
+    }
+
+    /// the capability-carrying hello message sent after connecting
+    pub(crate) fn hello(&self) -> ProtoEvent {
+        ProtoEvent::Hello {
+            commit: local_commit(),
+            caps: self.caps,
+        }
     }
 
     async fn connect_to_handle(self, handle: ClientHandle) -> Result<(), LanMouseConnectionError> {
@@ -193,10 +227,7 @@ impl LanMouseSender {
             // mirrors a Hello back so the receive loop can populate
             // `peer_commit`. Old peers will silently skip this event
             // per the forward-compat handler in [`receive_loop`].
-            let (buf, len) = ProtoEvent::Hello {
-                commit: local_commit(),
-            }
-            .into();
+            let (buf, len): ([u8; MAX_EVENT_SIZE], usize) = self.hello().into();
             if let Err(e) = conn.send(&buf[..len]).await {
                 log::debug!("hello send to {addr} failed: {e}");
             }
@@ -205,15 +236,7 @@ impl LanMouseSender {
             spawn_local(ping_pong(addr, conn.clone(), self.ping_response.clone()));
 
             // receiver
-            spawn_local(receive_loop(
-                self.client_manager.clone(),
-                handle,
-                addr,
-                conn,
-                self.conns.clone(),
-                self.recv_tx.clone(),
-                self.ping_response.clone(),
-            ));
+            spawn_local(receive_loop(self.clone(), handle, addr, conn));
             return Ok(());
         }
         self.connecting.lock().await.remove(&handle);
@@ -222,10 +245,15 @@ impl LanMouseSender {
 }
 
 impl LanMouseConnection {
-    pub(crate) fn new(cert: Certificate, client_manager: ClientManager) -> Self {
+    pub(crate) fn new(cert: Certificate, client_manager: ClientManager, caps: u8) -> Self {
         let (recv_tx, recv_rx) = channel();
-        let sender = LanMouseSender::new(cert, client_manager, recv_tx);
+        let sender = LanMouseSender::new(cert, client_manager, recv_tx, caps);
         Self { sender, recv_rx }
+    }
+
+    /// whether clipboard transfers are enabled locally
+    pub(crate) fn clipboard_enabled(&self) -> bool {
+        self.sender.caps & CAP_CLIPBOARD != 0
     }
 
     pub(crate) fn sender(&self) -> LanMouseSender {
@@ -274,16 +302,27 @@ async fn ping_pong(
 }
 
 async fn receive_loop(
-    client_manager: ClientManager,
+    sender: LanMouseSender,
     handle: ClientHandle,
     addr: SocketAddr,
     conn: Arc<dyn Conn + Send + Sync>,
-    conns: Rc<Mutex<HashMap<SocketAddr, Arc<dyn Conn + Send + Sync>>>>,
-    tx: Sender<(ClientHandle, ProtoEvent)>,
-    ping_response: Rc<RefCell<HashSet<SocketAddr>>>,
 ) {
+    let LanMouseSender {
+        client_manager,
+        conns,
+        recv_tx: tx,
+        ping_response,
+        clipboard_peers,
+        ..
+    } = sender;
     let mut buf = [0u8; MAX_EVENT_SIZE];
-    while conn.recv(&mut buf).await.is_ok() {
+    loop {
+        // `recv` only overwrites the received datagram, clear leftovers of
+        // previous (longer) datagrams so they can not be decoded as payload
+        buf.fill(0);
+        if conn.recv(&mut buf).await.is_err() {
+            break;
+        }
         match buf.try_into() {
             Ok(event) => {
                 log::trace!("{addr} <==<==<== {event}");
@@ -293,8 +332,13 @@ async fn receive_loop(
                         client_manager.set_alive(handle, b);
                         ping_response.borrow_mut().insert(addr);
                     }
-                    ProtoEvent::Hello { commit } => {
+                    ProtoEvent::Hello { commit, caps } => {
                         client_manager.set_peer_commit(handle, Some(commit));
+                        if caps & CAP_CLIPBOARD != 0 {
+                            clipboard_peers.borrow_mut().insert(handle);
+                        } else {
+                            clipboard_peers.borrow_mut().remove(&handle);
+                        }
                     }
                     event => tx.send((handle, event)).expect("channel closed"),
                 }
@@ -307,7 +351,7 @@ async fn receive_loop(
         }
     }
     log::warn!("recv error");
-    disconnect(&client_manager, handle, addr, &conns).await;
+    disconnect(&client_manager, handle, addr, &conns, &clipboard_peers).await;
 }
 
 async fn disconnect(
@@ -315,8 +359,10 @@ async fn disconnect(
     handle: ClientHandle,
     addr: SocketAddr,
     conns: &Mutex<HashMap<SocketAddr, Arc<dyn Conn + Send + Sync>>>,
+    clipboard_peers: &RefCell<HashSet<ClientHandle>>,
 ) {
     log::warn!("client ({handle}) @ {addr} connection closed");
+    clipboard_peers.borrow_mut().remove(&handle);
     conns.lock().await.remove(&addr);
     client_manager.set_active_addr(handle, None);
     client_manager.set_peer_commit(handle, None);

@@ -3,11 +3,11 @@ use crate::listen::{LanMouseListener, ListenEvent, ListenerCreationError};
 use futures::StreamExt;
 use input_emulation::{EmulationHandle, InputEmulation, InputEmulationError};
 use input_event::Event;
-use lan_mouse_proto::{ClipboardAssembly, ClipboardChunk, Position, ProtoEvent};
+use lan_mouse_proto::{CAP_CLIPBOARD, ClipboardAssembly, ClipboardChunk, Position, ProtoEvent};
 use local_channel::mpsc::{Receiver, Sender, channel};
 use std::{
     cell::Cell,
-    collections::HashMap,
+    collections::{HashMap, HashSet},
     net::SocketAddr,
     rc::Rc,
     time::{Duration, Instant},
@@ -75,14 +75,28 @@ enum EmulationRequest {
     Release(SocketAddr),
     ChangePort(u16),
     Terminate,
-    /// broadcast clipboard chunks to all incoming connections
-    Clipboard(Vec<ClipboardChunk>),
+    /// send a clipboard chunk to all incoming connections that support it
+    Clipboard(ClipboardChunk),
+}
+
+/// cloneable handle used to send clipboard chunks to peers connected to our listener
+#[derive(Clone)]
+pub(crate) struct ClipboardSender {
+    request_tx: Sender<EmulationRequest>,
+}
+
+impl ClipboardSender {
+    pub(crate) fn send(&self, chunk: ClipboardChunk) {
+        // the emulation task is gone during shutdown, nothing to do then
+        let _ = self.request_tx.send(EmulationRequest::Clipboard(chunk));
+    }
 }
 
 impl Emulation {
     pub(crate) fn new(
         backend: Option<input_emulation::Backend>,
         listener: LanMouseListener,
+        caps: u8,
     ) -> Self {
         let emulation_proxy = EmulationProxy::new(backend);
         let (request_tx, request_rx) = channel();
@@ -93,6 +107,8 @@ impl Emulation {
             request_rx,
             event_tx,
             clipboards: Default::default(),
+            caps,
+            clipboard_peers: Default::default(),
         };
         let task = spawn_local(emulation_task.run());
         Self {
@@ -108,10 +124,10 @@ impl Emulation {
             .expect("channel closed");
     }
 
-    pub(crate) fn send_clipboard(&self, chunks: Vec<ClipboardChunk>) {
-        self.request_tx
-            .send(EmulationRequest::Clipboard(chunks))
-            .expect("channel closed");
+    pub(crate) fn clipboard_sender(&self) -> ClipboardSender {
+        ClipboardSender {
+            request_tx: self.request_tx.clone(),
+        }
     }
 
     pub(crate) fn reenable(&self) {
@@ -149,6 +165,11 @@ struct ListenTask {
     event_tx: Sender<EmulationEvent>,
     /// reassembles clipboard transfers per peer
     clipboards: HashMap<SocketAddr, ClipboardAssembly>,
+    /// capability flags advertised to peers in our `Hello`
+    caps: u8,
+    /// peers whose `Hello` advertised [`CAP_CLIPBOARD`]. Peers predating
+    /// clipboard support drop the connection on clipboard datagrams.
+    clipboard_peers: HashSet<SocketAddr>,
 }
 
 impl ListenTask {
@@ -188,11 +209,16 @@ impl ListenTask {
                             // listener down) the version display would
                             // otherwise silently say "unknown" while
                             // the peer is in fact happily talking to us.
-                            ProtoEvent::Hello { commit } => {
-                                self.listener.reply(addr, ProtoEvent::Hello { commit: local_commit() }).await;
+                            ProtoEvent::Hello { commit, caps } => {
+                                if caps & CAP_CLIPBOARD != 0 {
+                                    self.clipboard_peers.insert(addr);
+                                } else {
+                                    self.clipboard_peers.remove(&addr);
+                                }
+                                self.listener.reply(addr, ProtoEvent::Hello { commit: local_commit(), caps: self.caps }).await;
                                 self.event_tx.send(EmulationEvent::PeerHello { addr, commit }).expect("channel closed");
                             }
-                            ProtoEvent::Clipboard(chunk) => {
+                            ProtoEvent::Clipboard(chunk) if self.caps & CAP_CLIPBOARD != 0 => {
                                 let assembly = self.clipboards.entry(addr).or_default();
                                 match assembly.handle(chunk) {
                                     Ok(Some(text)) => self.event_tx.send(EmulationEvent::ClipboardText { text }).expect("channel closed"),
@@ -222,10 +248,8 @@ impl ListenTask {
                     EmulationRequest::Reenable => self.emulation_proxy.reenable(),
                     // notify the other end that we hit a barrier (should release capture)
                     EmulationRequest::Release(addr) => self.listener.reply(addr, ProtoEvent::Leave(0)).await,
-                    EmulationRequest::Clipboard(chunks) => {
-                        for chunk in chunks {
-                            self.listener.broadcast(ProtoEvent::Clipboard(chunk)).await;
-                        }
+                    EmulationRequest::Clipboard(chunk) => {
+                        self.listener.send_to_peers(ProtoEvent::Clipboard(chunk), &self.clipboard_peers).await;
                     }
                     EmulationRequest::ChangePort(port) => {
                         self.listener.request_port_change(port);
@@ -240,6 +264,7 @@ impl ListenTask {
                             log::warn!("releasing keys: {addr} not responding!");
                             self.emulation_proxy.remove(addr);
                             self.clipboards.remove(&addr);
+                            self.clipboard_peers.remove(&addr);
                             self.event_tx.send(EmulationEvent::Disconnected { addr }).expect("channel closed");
                             false
                         } else {
