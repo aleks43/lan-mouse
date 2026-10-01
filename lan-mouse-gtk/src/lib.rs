@@ -10,7 +10,7 @@ mod macos_privacy;
 mod macos_status_item;
 mod window;
 
-use std::{env, process, str, sync::OnceLock};
+use std::{env, process, str, sync::OnceLock, time::Duration};
 
 use gtk::CssProvider;
 use window::Window;
@@ -19,6 +19,14 @@ use window::Window;
 /// main loop starts. Read by per-row UI to compare against each
 /// peer's [`lan_mouse_ipc::ClientState::peer_commit`] for the
 /// soft-warn version-mismatch indicator.
+/// How long the launching process waits for the service subprocess to exit
+/// after SIGINT before killing it.
+///
+/// On macOS a relaunched instance of the app is started this long (plus a
+/// safety margin) after quitting, so that it never starts while the old
+/// service is still shutting down, see `macos_privacy::relaunch_bundle`.
+pub const SERVICE_SHUTDOWN_TIMEOUT: Duration = Duration::from_secs(2);
+
 pub(crate) static LOCAL_COMMIT: OnceLock<[u8; 8]> = OnceLock::new();
 
 /// Convenience: returns the local commit as an 8-char ASCII string,
@@ -233,25 +241,32 @@ fn build_ui(app: &Application) {
         macos_status_item::setup(app, &window);
         // First-launch TCC prompts. No-op when already granted.
         macos_privacy::fire_initial_prompts();
-        // Watch the Accessibility grant continuously for the lifetime
-        // of the process. On a grant, swap the warning row into its
-        // "relaunch required" state (the daemon subprocess already
-        // bailed and can't recover without a restart). On a REVOKE,
-        // quit immediately — an active CGEventTap at
+        // Watch the Accessibility and Input Monitoring grants continuously
+        // for the lifetime of the process. On an Accessibility grant, swap
+        // the warning row into its "relaunch required" state (the daemon
+        // subprocess already bailed and can't recover without a restart).
+        // On an Accessibility REVOKE, quit immediately — an active CGEventTap at
         // HeadInsertEventTap can wedge system input if the process
         // lingers after losing AX, and forcing the process to exit is
         // the only bulletproof way to guarantee the kernel tears the
         // tap down.
         let window_weak = window.downgrade();
         let app_weak = app.downgrade();
-        macos_privacy::watch_accessibility_state(move |change| match change {
-            macos_privacy::AccessibilityChange::Granted => {
+        macos_privacy::watch_privacy_state(move |change| match change {
+            macos_privacy::PrivacyChange::AccessibilityGranted => {
                 if let Some(window) = window_weak.upgrade() {
                     window.present();
                     window.refresh_capture_emulation_status();
                 }
             }
-            macos_privacy::AccessibilityChange::Revoked => {
+            // Input Monitoring changes only affect the text and button of
+            // the warning row.
+            macos_privacy::PrivacyChange::InputMonitoringChanged => {
+                if let Some(window) = window_weak.upgrade() {
+                    window.refresh_capture_emulation_status();
+                }
+            }
+            macos_privacy::PrivacyChange::AccessibilityRevoked => {
                 log::warn!("Accessibility revoked — quitting to avoid wedging system input");
                 if let Some(app) = app_weak.upgrade() {
                     app.quit();

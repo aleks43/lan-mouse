@@ -16,11 +16,6 @@ use std::{
     io,
     process::{self, Child},
 };
-#[cfg(unix)]
-use std::{
-    thread,
-    time::{Duration, Instant},
-};
 use thiserror::Error;
 use tokio::task::LocalSet;
 
@@ -82,12 +77,16 @@ fn run() -> Result<(), LanMouseError> {
                 let res = lan_mouse_gtk::run(config::local_commit());
                 #[cfg(unix)]
                 {
+                    use std::{
+                        thread,
+                        time::{Duration, Instant},
+                    };
                     // on unix we give the service a chance to terminate gracefully
                     let pid = service.id() as libc::pid_t;
                     unsafe {
                         libc::kill(pid, libc::SIGINT);
                     }
-                    let deadline = Instant::now() + Duration::from_secs(2);
+                    let deadline = Instant::now() + lan_mouse_gtk::SERVICE_SHUTDOWN_TIMEOUT;
                     while service.try_wait()?.is_none() && Instant::now() < deadline {
                         thread::sleep(Duration::from_millis(50));
                     }

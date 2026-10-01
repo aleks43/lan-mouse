@@ -515,7 +515,7 @@ impl Window {
             row.set_subtitle("grant Accessibility permission to enable");
             set_button_content_label(button, "Grant");
         } else if !crate::macos_privacy::input_monitoring_granted() {
-            row.set_title("Input Monitoring is unavailable");
+            row.set_title("input monitoring is unavailable");
             row.set_subtitle("re-toggle Lan Mouse in System Settings to enable capture");
             set_button_content_label(button, "Open Settings");
         } else {
@@ -523,7 +523,7 @@ impl Window {
             // subprocess bailed at startup and needs a fresh process to
             // re-initialize with the new grant in place.
             row.set_title("relaunch required");
-            row.set_subtitle("Accessibility granted — restart to activate capture and emulation");
+            row.set_subtitle("permissions granted — restart to activate capture and emulation");
             set_button_content_label(button, "Relaunch");
         }
     }

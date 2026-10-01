@@ -1,11 +1,12 @@
 //! Tiny macOS Privacy-pane helpers used by the GUI.
 //!
-//! On macOS 13+, the Accessibility grant transitively confers the
-//! listen-only event-tap privilege that Input Monitoring gates and the
-//! synthesize-event privilege that Post Event gates, and the bundle
-//! typically isn't even listed in those separate panes. So the single
-//! user-facing action for any missing-capture or missing-emulation
-//! scenario is "re-toggle Accessibility" — we don't route elsewhere.
+//! Input capture needs both the Accessibility and the Input Monitoring
+//! grant (the capture backend checks both before creating its event tap),
+//! while emulation only needs Accessibility, which also covers the
+//! Post Event privilege. The GUI therefore first sends the user to the
+//! Accessibility pane and, once that is granted but capture is still
+//! unavailable, to the Input Monitoring pane. Only when both are granted
+//! is a relaunch required for the daemon subprocess to pick them up.
 
 use std::ffi::{c_uchar, c_void};
 use std::process::Command;
@@ -50,7 +51,8 @@ extern "C" {
 extern "C" {
     fn CGRequestListenEventAccess() -> c_uchar;
     fn CGRequestPostEventAccess() -> c_uchar;
-    fn CGPreflightListenEventAccess() -> bool;
+    // `bool` in C, kept as `c_uchar` for the same reason as above.
+    fn CGPreflightListenEventAccess() -> c_uchar;
 
     // CFMachPortRef CGEventTapCreate(
     //     CGEventTapLocation tap, CGEventTapPlacement place,
@@ -73,47 +75,60 @@ pub fn accessibility_granted() -> bool {
 }
 
 pub fn input_monitoring_granted() -> bool {
-    unsafe { CGPreflightListenEventAccess() }
+    let raw = unsafe { CGPreflightListenEventAccess() };
+    log::debug!("CGPreflightListenEventAccess() = {raw}");
+    raw != 0
 }
 
-pub enum AccessibilityChange {
+pub enum PrivacyChange {
     /// AX was missing at startup and the user has now granted it.
     /// Capture/emulation still need a relaunch to take effect, since
     /// the daemon subprocess already bailed.
-    Granted,
+    AccessibilityGranted,
     /// AX was granted and the user has now revoked it. Quit immediately
     /// — leaving the process alive with an active CGEventTap at
     /// HeadInsertEventTap can wedge system input (clicks/keys silently
     /// consumed) until the process dies. See
     /// macos-cgeventtap-drop-fallthrough-tcc-revoke skill for the
     /// underlying event-tap-disable footgun.
-    Revoked,
+    AccessibilityRevoked,
+    /// Input Monitoring was granted or revoked. The warning row has to be
+    /// updated to point the user to the right next step.
+    InputMonitoringChanged,
 }
 
-/// Poll for Accessibility grant/revoke transitions. Starts a 1-second
-/// GLib timer that fires `on_change` every time `AXIsProcessTrusted()`
-/// flips, and keeps running for the lifetime of the process.
+/// Poll for Accessibility and Input Monitoring grant/revoke transitions.
+/// Starts a 1-second GLib timer that fires `on_change` every time
+/// `AXIsProcessTrusted()` or `CGPreflightListenEventAccess()` flips, and
+/// keeps running for the lifetime of the process.
 ///
 /// We rely on polling rather than AXObserver because the AX notification
 /// API requires a trusted process to subscribe — the precondition we
 /// can't assume. This runs on the GTK main thread (via
 /// `timeout_add_seconds_local`).
-pub fn watch_accessibility_state<F>(mut on_change: F)
+pub fn watch_privacy_state<F>(mut on_change: F)
 where
-    F: FnMut(AccessibilityChange) + 'static,
+    F: FnMut(PrivacyChange) + 'static,
 {
-    let mut last = accessibility_granted();
-    log::info!("watching Accessibility state (initial = {last})");
+    let mut last_ax = accessibility_granted();
+    let mut last_im = input_monitoring_granted();
+    log::info!("watching privacy state (Accessibility = {last_ax}, Input Monitoring = {last_im})");
     glib::timeout_add_seconds_local(1, move || {
-        let current = accessibility_granted();
-        if current != last {
-            log::info!("Accessibility state flip: {last} -> {current}");
-            on_change(if current {
-                AccessibilityChange::Granted
+        let ax = accessibility_granted();
+        if ax != last_ax {
+            log::info!("Accessibility state flip: {last_ax} -> {ax}");
+            on_change(if ax {
+                PrivacyChange::AccessibilityGranted
             } else {
-                AccessibilityChange::Revoked
+                PrivacyChange::AccessibilityRevoked
             });
-            last = current;
+            last_ax = ax;
+        }
+        let im = input_monitoring_granted();
+        if im != last_im {
+            log::info!("Input Monitoring state flip: {last_im} -> {im}");
+            on_change(PrivacyChange::InputMonitoringChanged);
+            last_im = im;
         }
         glib::ControlFlow::Continue
     });
@@ -128,12 +143,18 @@ pub fn open_input_monitoring_settings() {
 }
 
 /// Spawn a fresh instance of the current `.app` bundle via Launch Services
-/// after a 3-second delay, so the new instance starts *after* the current
+/// after a delay, so the new instance starts *after* the current
 /// process has exited — otherwise Launch Services reactivates the existing
-/// process instead of launching a fresh one, and the stale IPC socket
-/// would block the new daemon subprocess. The caller is responsible for
-/// quitting the current process (e.g. `Application::quit()`) after this.
+/// process instead of launching a fresh one, and the old daemon subprocess
+/// that still holds the IPC socket would block the new one. On exit the
+/// launcher waits up to [`crate::SERVICE_SHUTDOWN_TIMEOUT`] for the
+/// daemon before killing it, so the delay is that timeout plus a margin.
+/// The caller is responsible for quitting the current process
+/// (e.g. `Application::quit()`) after this.
 pub fn relaunch_bundle() {
+    /// safety margin on top of the service shutdown timeout
+    const RELAUNCH_MARGIN_SECS: u64 = 1;
+
     // Resolve the .app bundle path from the current executable: it lives
     // at <bundle>/Contents/MacOS/lan-mouse, so three parents up is the
     // bundle root we hand to `open`.
@@ -150,7 +171,8 @@ pub fn relaunch_bundle() {
 
     // Trailing `&` backgrounds the sleep+open so our shell call returns
     // immediately; the spawned shell is adopted by launchd once we exit.
-    let cmd = format!("(sleep 3 && open {bundle:?}) &");
+    let delay = crate::SERVICE_SHUTDOWN_TIMEOUT.as_secs() + RELAUNCH_MARGIN_SECS;
+    let cmd = format!("(sleep {delay} && open {bundle:?}) &");
     let _ = Command::new("sh").arg("-c").arg(cmd).spawn();
 }
 
