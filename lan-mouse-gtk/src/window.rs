@@ -510,18 +510,21 @@ impl Window {
         let row = &self.imp().capture_status_row;
         let button = &self.imp().input_capture_button;
 
-        if crate::macos_privacy::accessibility_granted() {
+        if !crate::macos_privacy::accessibility_granted() {
+            row.set_title("input capture is disabled");
+            row.set_subtitle("grant Accessibility permission to enable");
+            set_button_content_label(button, "Grant");
+        } else if !crate::macos_privacy::input_monitoring_granted() {
+            row.set_title("Input Monitoring is unavailable");
+            row.set_subtitle("re-toggle Lan Mouse in System Settings to enable capture");
+            set_button_content_label(button, "Open Settings");
+        } else {
             // AX granted but capture/emulation still off → the daemon
             // subprocess bailed at startup and needs a fresh process to
             // re-initialize with the new grant in place.
             row.set_title("relaunch required");
             row.set_subtitle("Accessibility granted — restart to activate capture and emulation");
             set_button_content_label(button, "Relaunch");
-        } else {
-            // AX missing → send the user to System Settings.
-            row.set_title("input capture is disabled");
-            row.set_subtitle("grant Accessibility permission to enable");
-            set_button_content_label(button, "Grant");
         }
     }
 

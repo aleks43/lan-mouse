@@ -50,6 +50,7 @@ extern "C" {
 extern "C" {
     fn CGRequestListenEventAccess() -> c_uchar;
     fn CGRequestPostEventAccess() -> c_uchar;
+    fn CGPreflightListenEventAccess() -> bool;
 
     // CFMachPortRef CGEventTapCreate(
     //     CGEventTapLocation tap, CGEventTapPlacement place,
@@ -69,6 +70,10 @@ pub fn accessibility_granted() -> bool {
     let raw = unsafe { AXIsProcessTrusted() };
     log::debug!("AXIsProcessTrusted() = {raw}");
     raw != 0
+}
+
+pub fn input_monitoring_granted() -> bool {
+    unsafe { CGPreflightListenEventAccess() }
 }
 
 pub enum AccessibilityChange {
@@ -118,8 +123,12 @@ pub fn open_accessibility_settings() {
     open_url("x-apple.systempreferences:com.apple.preference.security?Privacy_Accessibility");
 }
 
+pub fn open_input_monitoring_settings() {
+    open_url("x-apple.systempreferences:com.apple.preference.security?Privacy_ListenEvent");
+}
+
 /// Spawn a fresh instance of the current `.app` bundle via Launch Services
-/// after a 1-second delay, so the new instance starts *after* the current
+/// after a 3-second delay, so the new instance starts *after* the current
 /// process has exited — otherwise Launch Services reactivates the existing
 /// process instead of launching a fresh one, and the stale IPC socket
 /// would block the new daemon subprocess. The caller is responsible for
@@ -141,7 +150,7 @@ pub fn relaunch_bundle() {
 
     // Trailing `&` backgrounds the sleep+open so our shell call returns
     // immediately; the spawned shell is adopted by launchd once we exit.
-    let cmd = format!("(sleep 1 && open {bundle:?}) &");
+    let cmd = format!("(sleep 3 && open {bundle:?}) &");
     let _ = Command::new("sh").arg("-c").arg(cmd).spawn();
 }
 
