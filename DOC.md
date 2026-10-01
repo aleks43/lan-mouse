@@ -51,6 +51,20 @@ sequenceDiagram
     Bob-->>-Alice: Ack (Keyboard Layout)
 ```
 
+## Clipboard
+
+The text clipboard is synchronized with `ProtoEvent::Clipboard` events
+(see `lan-mouse-proto`). A text is split into chunks of at most
+`CLIPBOARD_CHUNK_SIZE` bytes (on UTF-8 boundaries) that share a transfer id and
+are numbered; the chunk with `last` set ends the transfer. Chunks are plain
+unacknowledged datagrams: a lost, duplicated or reordered chunk drops the transfer.
+
+Peers predating clipboard support receive datagrams into a 17 byte buffer and
+close the connection when a longer datagram arrives. Therefore clipboard events
+are only sent to peers whose `Hello` event advertised `CAP_CLIPBOARD` in its
+`caps` byte (appended after the commit hash, older peers do not send it and
+ignore it when receiving).
+
 ## Problems
 The general Idea is to have a bidirectional connection by default, meaning
 any connected device can not only receive events but also send events back.

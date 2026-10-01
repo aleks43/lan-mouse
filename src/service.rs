@@ -3,7 +3,7 @@ use crate::{
     client::ClientManager,
     clipboard::{Clipboard, ClipboardEvent},
     config::{Config, ConfigClient},
-    connect::{LanMouseConnection, LanMouseSender},
+    connect::LanMouseConnection,
     crypto,
     dns::{DnsEvent, DnsResolver},
     emulation::{Emulation, EmulationEvent},
@@ -14,10 +14,9 @@ use lan_mouse_ipc::{
     AsyncFrontendListener, ClientHandle, FrontendEvent, FrontendRequest, IpcError,
     IpcListenerCreationError, Position, Status,
 };
-use lan_mouse_proto::{ProtoEvent, clipboard_chunks};
+use lan_mouse_proto::CAP_CLIPBOARD;
 use log;
 use std::{
-    cell::Cell,
     collections::{HashMap, HashSet, VecDeque},
     io,
     net::{IpAddr, SocketAddr},
@@ -72,11 +71,6 @@ pub struct Service {
     next_trigger_handle: u64,
     /// clipboard synchronization
     clipboard: Clipboard,
-    /// sending half of the client connections, used to
-    /// broadcast clipboard updates
-    conn_sender: LanMouseSender,
-    /// id of the next outgoing clipboard transfer
-    clipboard_transfer: Cell<u32>,
 }
 
 #[derive(Debug)]
@@ -104,14 +98,21 @@ impl Service {
         // listener + connection
         let listener =
             LanMouseListener::new(config.port(), cert.clone(), authorized_keys.clone()).await?;
-        let conn = LanMouseConnection::new(cert.clone(), client_manager.clone());
+        let caps = if config.clipboard() { CAP_CLIPBOARD } else { 0 };
+        let conn = LanMouseConnection::new(cert.clone(), client_manager.clone(), caps);
         let conn_sender = conn.sender();
 
         // input capture + emulation
         let capture_backend = config.capture_backend().map(|b| b.into());
         let capture = Capture::new(capture_backend, conn, config.release_bind());
         let emulation_backend = config.emulation_backend().map(|b| b.into());
-        let emulation = Emulation::new(emulation_backend, listener);
+        let emulation = Emulation::new(emulation_backend, listener, caps);
+        let clipboard = Clipboard::new(
+            config.clipboard(),
+            conn_sender,
+            client_manager.clone(),
+            emulation.clipboard_sender(),
+        );
 
         // create dns resolver
         let resolver = DnsResolver::new()?;
@@ -134,9 +135,7 @@ impl Service {
             incoming_conn_info: Default::default(),
             incoming_conns: Default::default(),
             next_trigger_handle: 0,
-            clipboard: Clipboard::new(),
-            conn_sender,
-            clipboard_transfer: Cell::new(0),
+            clipboard,
         };
         Ok(service)
     }
@@ -161,7 +160,7 @@ impl Service {
                 event = self.emulation.event() => self.handle_emulation_event(event),
                 event = self.capture.event() => self.handle_capture_event(event),
                 event = self.resolver.event() => self.handle_resolver_event(event),
-                event = self.clipboard.event() => self.handle_clipboard_event(event).await,
+                event = self.clipboard.event() => self.handle_clipboard_event(event),
                 _ = self.config.changed() => self.handle_config_change(),
                 r = signal::ctrl_c() => break r.expect("failed to wait for CTRL+C"),
             }
@@ -379,30 +378,12 @@ impl Service {
         }
     }
 
-    async fn handle_clipboard_event(&mut self, event: ClipboardEvent) {
+    fn handle_clipboard_event(&mut self, event: ClipboardEvent) {
         match event {
             ClipboardEvent::Unavailable => {
                 log::info!("clipboard sync unavailable, disabling");
             }
-            ClipboardEvent::Changed(text) => {
-                let transfer = self.clipboard_transfer.get();
-                self.clipboard_transfer.set(transfer.wrapping_add(1));
-                let chunks = clipboard_chunks(transfer, &text);
-                log::debug!("sharing clipboard text ({} bytes)", text.len());
-                // A clipboard update is also a useful opportunity to restore a
-                // connection after the peer was restarted. `send` deduplicates
-                // concurrent connection attempts for a handle.
-                for handle in self.client_manager.active_clients() {
-                    for chunk in chunks.iter() {
-                        let event = ProtoEvent::Clipboard(chunk.clone());
-                        if let Err(e) = self.conn_sender.send(event, handle).await {
-                            log::debug!("failed to send clipboard to client {handle}: {e}");
-                        }
-                    }
-                }
-                // peers that connected to us (listen side)
-                self.emulation.send_clipboard(chunks);
-            }
+            ClipboardEvent::Changed(text) => self.clipboard.share(text),
         }
     }
 
